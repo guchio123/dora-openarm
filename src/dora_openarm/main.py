@@ -18,6 +18,7 @@ import argparse
 import dataclasses
 import enum
 import dora
+import openarm_can
 import openarm_driver
 import os
 import pathlib
@@ -197,6 +198,42 @@ def command_epoch_matches(metadata: dict, start_epoch: int) -> bool:
     )
 
 
+def create_arm(name, config, can_interface):
+    """Create the driver and put the gripper motor in the mode it is driven in.
+
+    The driver sends POS_FORCE commands to the gripper when the config says
+    gripper_posforce, but never writes the motor's CTRL_MODE register. A motor
+    left in MIT mode (the factory default, and what a power cycle restores
+    unless the mode was saved to flash) ignores those commands, so the gripper
+    neither moves nor answers. Writing the mode is done before enable_all().
+    """
+    arm = openarm_driver.SingleArmDriver(name, config, can_interface=can_interface)
+    if arm.gripper_posforce:
+        arm.openarm.get_gripper().set_control_mode_all(
+            openarm_can.ControlMode.POS_FORCE
+        )
+    return arm
+
+
+def try_create_arm(name, config, can_interface):
+    """create_arm, or None (with the reason on stdout) when the CAN link is missing.
+
+    A PCAN adapter that dropped off USB leaves no can0/can1, and the driver raises
+    while opening the socket. Raising here would end the node, and with it the
+    dataflow; staying stopped lets the operator fix the link (README 2-1) and
+    press Start Arm again.
+    """
+    try:
+        return create_arm(name, config, can_interface)
+    except openarm_can.CANSocketException as error:
+        print(
+            f"{name}: cannot start, CAN is not available ({error}); staying stopped. "
+            "Bring the CAN interface up and press Start Arm again.",
+            flush=True,
+        )
+        return None
+
+
 def main():
     """Move to the given position and output the current position."""
     parser = argparse.ArgumentParser(description="Control OpenArm")
@@ -281,9 +318,8 @@ def main():
         return result
 
     if args.start_on_startup:
-        arm = openarm_driver.SingleArmDriver(
-            name, config, can_interface=args.can_interface
-        )
+        arm = try_create_arm(name, config, args.can_interface)
+    if arm is not None:
         arm.start()
         start_epoch += 1
         align_state = (
@@ -305,10 +341,18 @@ def main():
             if command == "start":
                 if arm is not None:
                     arm.stop()  # Stop the existing session before replacing it
+                    arm = None
                 # Re-initialize the arm to ensure a fresh start
-                arm = openarm_driver.SingleArmDriver(
-                    name, config, can_interface=args.can_interface
-                )
+                arm = try_create_arm(name, config, args.can_interface)
+                if arm is None:
+                    status = ArmStatus.STOPPED
+                    align_state = None
+                    node.send_output(
+                        "status",
+                        pa.array([ArmStatus.STOPPED]),
+                        output_metadata(event["metadata"]),
+                    )
+                    continue
                 arm.start()
                 start_epoch += 1
                 align_state = (
